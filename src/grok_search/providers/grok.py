@@ -146,12 +146,11 @@ class GrokSearchProvider(BaseSearchProvider):
                 },
                 {"role": "user", "content": time_context + query + platform_prompt},
             ],
-            "stream": True,
         }
 
         await log_info(ctx, f"platform_prompt: { query + platform_prompt}", config.debug_enabled)
 
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_with_retry(headers, payload, ctx)
 
     async def fetch(self, url: str, ctx=None) -> str:
         headers = {
@@ -167,9 +166,35 @@ class GrokSearchProvider(BaseSearchProvider):
                 },
                 {"role": "user", "content": url + "\n获取该网页内容并返回其结构化Markdown格式" },
             ],
-            "stream": True,
         }
-        return await self._execute_stream_with_retry(headers, payload, ctx)
+        return await self._execute_with_retry(headers, payload, ctx)
+
+    async def _execute_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
+        """执行带重试机制的非流式 HTTP 请求"""
+        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
+
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            async for attempt in AsyncRetrying(
+                stop=stop_after_attempt(config.retry_max_attempts + 1),
+                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
+                retry=retry_if_exception(_is_retryable_exception),
+                reraise=True,
+            ):
+                with attempt:
+                    response = await client.post(
+                        f"{self.api_url}/chat/completions",
+                        headers=headers,
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    content = ""
+                    choices = data.get("choices", [])
+                    if choices:
+                        message = choices[0].get("message", {})
+                        content = message.get("content", "")
+                    await log_info(ctx, f"content: {content}", config.debug_enabled)
+                    return content
 
     async def _parse_streaming_response(self, response, ctx=None) -> str:
         content = ""
@@ -212,27 +237,6 @@ class GrokSearchProvider(BaseSearchProvider):
 
         return content
 
-    async def _execute_stream_with_retry(self, headers: dict, payload: dict, ctx=None) -> str:
-        """执行带重试机制的流式 HTTP 请求"""
-        timeout = httpx.Timeout(connect=6.0, read=120.0, write=10.0, pool=None)
-
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            async for attempt in AsyncRetrying(
-                stop=stop_after_attempt(config.retry_max_attempts + 1),
-                wait=_WaitWithRetryAfter(config.retry_multiplier, config.retry_max_wait),
-                retry=retry_if_exception(_is_retryable_exception),
-                reraise=True,
-            ):
-                with attempt:
-                    async with client.stream(
-                        "POST",
-                        f"{self.api_url}/chat/completions",
-                        headers=headers,
-                        json=payload,
-                    ) as response:
-                        response.raise_for_status()
-                        return await self._parse_streaming_response(response, ctx)
-
     async def describe_url(self, url: str, ctx=None) -> dict:
         """让 Grok 阅读单个 URL 并返回 title + extracts"""
         headers = {
@@ -245,9 +249,8 @@ class GrokSearchProvider(BaseSearchProvider):
                 {"role": "system", "content": url_describe_prompt},
                 {"role": "user", "content": url},
             ],
-            "stream": True,
         }
-        result = await self._execute_stream_with_retry(headers, payload, ctx)
+        result = await self._execute_with_retry(headers, payload, ctx)
         title, extracts = url, ""
         for line in result.strip().splitlines():
             if line.startswith("Title:"):
@@ -268,9 +271,8 @@ class GrokSearchProvider(BaseSearchProvider):
                 {"role": "system", "content": rank_sources_prompt},
                 {"role": "user", "content": f"Query: {query}\n\n{sources_text}"},
             ],
-            "stream": True,
         }
-        result = await self._execute_stream_with_retry(headers, payload, ctx)
+        result = await self._execute_with_retry(headers, payload, ctx)
         order: list[int] = []
         seen: set[int] = set()
         for token in result.strip().split():
